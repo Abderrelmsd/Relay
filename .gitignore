@@ -1,0 +1,11 @@
+bin/
+obj/
+*.user
+.vs/
+.idea/
+.DS_Store
+artifacts/
+*.nupkg
+.dotnet-home/
+.nuget/
+.claude/
