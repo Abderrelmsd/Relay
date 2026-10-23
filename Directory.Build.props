@@ -11,7 +11,7 @@
 
   <!-- Shared package metadata (non-test projects) -->
   <PropertyGroup Condition="!$(MSBuildProjectName.EndsWith('.Tests'))">
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>Abderrahmane El Massaoudi</Authors>
     <PackageReadmeFile>README.md</PackageReadmeFile>
     <RepositoryType>git</RepositoryType>

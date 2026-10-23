@@ -61,6 +61,14 @@ Failed attempts are appended to an attempt log while a message is retried; succe
 On Postgres, enqueue inside your own transaction so the message commits with your data:
 `PostgresRelayStore.EnqueueInTransactionAsync(connection, transaction, message)`.
 
+## Several stores
+
+A product with several databases (one per cluster, say) keeps a Relay table in each: `AddRelayPostgresStore(dataSource, "schema.table")`
+once per database. One dispatcher drains them all; messages enqueued without a transaction go to the first store, and
+transactional ones go into whichever database their connection is on: `PostgresRelayStore.EnqueueInTransactionAsync(connection, transaction, message, table)`.
+The admin API lists, requeues and purges across stores and sums their stats. A store's table defaults to `relay_messages`;
+`SchemaSql` gives the DDL for its own name.
+
 ## Stores
 
 `IRelayStore` is the contract, and the in-memory store is its reference implementation. The Postgres store implements the same rules in one SQL statement using `FOR UPDATE SKIP LOCKED`. The Postgres integration tests need Docker and are skipped without it.

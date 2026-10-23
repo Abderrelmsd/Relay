@@ -30,12 +30,24 @@ public static class ServiceCollectionExtensions
     public static IServiceCollection AddRelayDispatcher(this IServiceCollection services)
         => services.AddHostedService<RelayDispatcher>();
 
-    /// <summary>Uses Postgres. Call before <see cref="AddRelay"/>. Run <see cref="PostgresRelayStore.EnsureSchemaAsync"/> (or apply <see cref="PostgresRelayStore.CreateSql"/> in a migration) once.</summary>
-    public static IServiceCollection AddRelayPostgres(this IServiceCollection services, NpgsqlDataSource dataSource)
+    /// <summary>Uses Postgres. Call before <see cref="AddRelay"/>. Run <see cref="PostgresRelayStore.EnsureSchemaAsync"/> (or apply <see cref="PostgresRelayStore.SchemaSql"/> in a migration) once.</summary>
+    public static IServiceCollection AddRelayPostgres(this IServiceCollection services, NpgsqlDataSource dataSource, string table = PostgresRelayStore.DefaultTable)
     {
         services.RemoveAll<IRelayStore>();
-        services.AddSingleton(new PostgresRelayStore(dataSource));
+        services.AddSingleton(new PostgresRelayStore(dataSource, table));
         services.AddSingleton<IRelayStore>(sp => sp.GetRequiredService<PostgresRelayStore>());
+        return services;
+    }
+
+    /// <summary>
+    /// Adds one more Postgres store (another database, a cluster of its own) that the dispatcher drains too; the in-memory default is dropped.
+    /// Messages enqueued without a transaction go to the first store; transactional ones go wherever their connection is.
+    /// </summary>
+    public static IServiceCollection AddRelayPostgresStore(this IServiceCollection services, NpgsqlDataSource dataSource, string table = PostgresRelayStore.DefaultTable)
+    {
+        var memory = services.Where(d => d.ServiceType == typeof(IRelayStore) && d.ImplementationType == typeof(InMemoryRelayStore)).ToList();
+        foreach (var d in memory) services.Remove(d);
+        services.AddSingleton<IRelayStore>(new PostgresRelayStore(dataSource, table));
         return services;
     }
 

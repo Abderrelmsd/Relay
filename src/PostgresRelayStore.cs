@@ -4,9 +4,19 @@ using NpgsqlTypes;
 
 namespace Relay;
 
-/// <summary>Postgres store. Claiming uses <c>FOR UPDATE SKIP LOCKED</c> so many workers/instances share one table safely; per-key ordering is enforced in the claim query.</summary>
-public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStore
+/// <summary>
+/// Postgres store. Claiming uses <c>FOR UPDATE SKIP LOCKED</c> so many workers/instances share one table safely; per-key ordering is enforced
+/// in the claim query. The table is <c>relay_messages</c> unless named (<c>table</c> or <c>schema.table</c>), so a product can keep one
+/// store per database (one per cluster, say) and put the table in its own schema.
+/// </summary>
+public sealed partial class PostgresRelayStore(NpgsqlDataSource dataSource, string table = PostgresRelayStore.DefaultTable) : IRelayStore
 {
+    public const string DefaultTable = "relay_messages";
+
+    private readonly string _table = Qualify(table);
+    private readonly string _name = table;
+
+    /// <summary>The schema for the default table (<see cref="SchemaSql"/> gives it for this store's table).</summary>
     public const string CreateSql = """
         CREATE TABLE IF NOT EXISTS relay_messages (
           sequence      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -28,29 +38,50 @@ public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStor
         CREATE INDEX IF NOT EXISTS ix_relay_key ON relay_messages (destination, ordering_key, sequence) WHERE ordering_key IS NOT NULL;
         """;
 
+    /// <summary>The DDL of this store's table and its indexes; apply it in a migration, or run <see cref="EnsureSchemaAsync"/>.</summary>
+    public string SchemaSql => SchemaFor(_name);
+
+    /// <summary>The DDL for a table (<c>table</c> or <c>schema.table</c>).</summary>
+    public static string SchemaFor(string table)
+    {
+        var qualified = Qualify(table);
+        var index = qualified.Replace("\"", "", StringComparison.Ordinal).Replace('.', '_');
+        return CreateSql
+            .Replace("CREATE TABLE IF NOT EXISTS relay_messages (", $"CREATE TABLE IF NOT EXISTS {qualified} (", StringComparison.Ordinal)
+            .Replace("ix_relay_due ON relay_messages", $"ix_{index}_due ON {qualified}", StringComparison.Ordinal)
+            .Replace("ix_relay_key ON relay_messages", $"ix_{index}_key ON {qualified}", StringComparison.Ordinal);
+    }
+
     private const string Columns = "sequence, id, destination, ordering_key, payload, headers, created_at, available_at, attempts, status, claimed_by, claimed_until, tenant_id, attempt_log";
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
     public async Task EnsureSchemaAsync(CancellationToken ct = default)
     {
-        await using var cmd = dataSource.CreateCommand(CreateSql);
+        await using var cmd = dataSource.CreateCommand(SchemaSql);
         await cmd.ExecuteNonQueryAsync(ct);
     }
 
     public async Task<bool> EnqueueAsync(RelayMessage m, CancellationToken ct)
     {
         await using var conn = await dataSource.OpenConnectionAsync(ct);
-        return await InsertAsync(conn, null, m, ct);
+        return await InsertAsync(conn, null, m, _table, ct);
     }
 
     /// <summary>Enqueues on the caller's connection and transaction, so the message commits or rolls back with the business change (transactional outbox).</summary>
     public Task<bool> EnqueueInTransactionAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, RelayMessage message, CancellationToken ct = default)
-        => InsertAsync(connection, transaction, message, ct);
+        => InsertAsync(connection, transaction, message, _table, ct);
 
-    private static async Task<bool> InsertAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, RelayMessage m, CancellationToken ct)
+    /// <summary>
+    /// Enqueues into <paramref name="table"/> on the caller's connection and transaction, for code that has the connection but not the store
+    /// (the store whose database it is delivers it).
+    /// </summary>
+    public static Task<bool> EnqueueInTransactionAsync(NpgsqlConnection connection, NpgsqlTransaction? transaction, RelayMessage message, string table, CancellationToken ct = default)
+        => InsertAsync(connection, transaction, message, Qualify(table), ct);
+
+    private static async Task<bool> InsertAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, RelayMessage m, string table, CancellationToken ct)
     {
-        await using var cmd = new NpgsqlCommand("""
-            INSERT INTO relay_messages (id, destination, ordering_key, payload, headers, created_at, available_at, tenant_id)
+        await using var cmd = new NpgsqlCommand($"""
+            INSERT INTO {table} (id, destination, ordering_key, payload, headers, created_at, available_at, tenant_id)
             VALUES (@id, @dest, @key, @payload, @headers, @created, @avail, @tenant)
             ON CONFLICT (id) DO NOTHING
             """, conn, tx);
@@ -69,17 +100,17 @@ public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStor
     {
         await using var cmd = dataSource.CreateCommand($"""
             WITH candidates AS (
-              SELECT m.sequence FROM relay_messages m
+              SELECT m.sequence FROM {_table} m
               WHERE ((m.status = 0 AND m.available_at <= @now) OR (m.status = 1 AND m.claimed_until <= @now))
                 AND NOT (m.destination = ANY(@excluded))
                 AND (m.ordering_key IS NULL OR NOT EXISTS (
-                      SELECT 1 FROM relay_messages o
+                      SELECT 1 FROM {_table} o
                       WHERE o.destination = m.destination AND o.ordering_key = m.ordering_key
                         AND o.sequence < m.sequence AND o.status IN (0, 1)))
               ORDER BY m.sequence
               LIMIT @max
               FOR UPDATE SKIP LOCKED)
-            UPDATE relay_messages r
+            UPDATE {_table} r
                SET status = 1, claimed_by = @worker, claimed_until = @until, attempts = r.attempts + 1
               FROM candidates c
              WHERE r.sequence = c.sequence
@@ -94,28 +125,28 @@ public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStor
     }
 
     public Task<bool> CompleteAsync(Guid id, string workerId, CancellationToken ct)
-        => ExecAsync("DELETE FROM relay_messages WHERE id = @id AND status = 1 AND claimed_by = @w", id, workerId, ct);
+        => ExecAsync($"DELETE FROM {_table} WHERE id = @id AND status = 1 AND claimed_by = @w", id, workerId, ct);
 
     public Task<bool> RetryLaterAsync(Guid id, string workerId, DateTimeOffset availableAt, AttemptRecord attempt, CancellationToken ct)
-        => ExecAsync("""
-            UPDATE relay_messages SET status = 0, available_at = @at, claimed_by = NULL, claimed_until = NULL,
+        => ExecAsync($"""
+            UPDATE {_table} SET status = 0, available_at = @at, claimed_by = NULL, claimed_until = NULL,
                    attempt_log = COALESCE(attempt_log, '[]'::jsonb) || @attempt
              WHERE id = @id AND status = 1 AND claimed_by = @w
             """, id, workerId, ct, c => { c.Parameters.AddWithValue("at", availableAt); AddAttempt(c, attempt); });
 
     public Task<bool> DeadLetterAsync(Guid id, string workerId, AttemptRecord attempt, CancellationToken ct)
-        => ExecAsync("""
-            UPDATE relay_messages SET status = 2, claimed_by = NULL, claimed_until = NULL,
+        => ExecAsync($"""
+            UPDATE {_table} SET status = 2, claimed_by = NULL, claimed_until = NULL,
                    attempt_log = COALESCE(attempt_log, '[]'::jsonb) || @attempt
              WHERE id = @id AND status = 1 AND claimed_by = @w
             """, id, workerId, ct, c => AddAttempt(c, attempt));
 
     public Task<bool> ReleaseAsync(Guid id, string workerId, CancellationToken ct)
-        => ExecAsync("UPDATE relay_messages SET status = 0, claimed_by = NULL, claimed_until = NULL, attempts = GREATEST(attempts - 1, 0) WHERE id = @id AND status = 1 AND claimed_by = @w", id, workerId, ct);
+        => ExecAsync($"UPDATE {_table} SET status = 0, claimed_by = NULL, claimed_until = NULL, attempts = GREATEST(attempts - 1, 0) WHERE id = @id AND status = 1 AND claimed_by = @w", id, workerId, ct);
 
     public async Task<IReadOnlyList<RelayMessage>> ListDeadLettersAsync(string? destination, int skip, int take, CancellationToken ct)
     {
-        await using var cmd = dataSource.CreateCommand($"SELECT {Columns} FROM relay_messages WHERE status = 2 AND (@dest::text IS NULL OR destination = @dest) ORDER BY sequence OFFSET @skip LIMIT @take");
+        await using var cmd = dataSource.CreateCommand($"SELECT {Columns} FROM {_table} WHERE status = 2 AND (@dest::text IS NULL OR destination = @dest) ORDER BY sequence OFFSET @skip LIMIT @take");
         cmd.Parameters.AddWithValue("dest", (object?)destination ?? DBNull.Value);
         cmd.Parameters.AddWithValue("skip", skip);
         cmd.Parameters.AddWithValue("take", take);
@@ -124,7 +155,7 @@ public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStor
 
     public async Task<bool> RequeueDeadLetterAsync(Guid id, DateTimeOffset now, CancellationToken ct)
     {
-        await using var cmd = dataSource.CreateCommand("UPDATE relay_messages SET status = 0, attempts = 0, available_at = @now, attempt_log = NULL WHERE id = @id AND status = 2");
+        await using var cmd = dataSource.CreateCommand($"UPDATE {_table} SET status = 0, attempts = 0, available_at = @now, attempt_log = NULL WHERE id = @id AND status = 2");
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("now", now);
         return await cmd.ExecuteNonQueryAsync(ct) == 1;
@@ -132,16 +163,16 @@ public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStor
 
     public async Task<bool> PurgeDeadLetterAsync(Guid id, CancellationToken ct)
     {
-        await using var cmd = dataSource.CreateCommand("DELETE FROM relay_messages WHERE id = @id AND status = 2");
+        await using var cmd = dataSource.CreateCommand($"DELETE FROM {_table} WHERE id = @id AND status = 2");
         cmd.Parameters.AddWithValue("id", id);
         return await cmd.ExecuteNonQueryAsync(ct) == 1;
     }
 
     public async Task<RelayStats> GetStatsAsync(CancellationToken ct)
     {
-        await using var cmd = dataSource.CreateCommand("""
+        await using var cmd = dataSource.CreateCommand($"""
             SELECT count(*) FILTER (WHERE status = 0), count(*) FILTER (WHERE status = 1), count(*) FILTER (WHERE status = 2),
-                   min(created_at) FILTER (WHERE status = 0) FROM relay_messages
+                   min(created_at) FILTER (WHERE status = 0) FROM {_table}
             """);
         await using var r = await cmd.ExecuteReaderAsync(ct);
         await r.ReadAsync(ct);
@@ -175,4 +206,17 @@ public sealed class PostgresRelayStore(NpgsqlDataSource dataSource) : IRelayStor
         }
         return list;
     }
+
+    /// <summary>Quotes <c>table</c> or <c>schema.table</c> after checking each part is a plain identifier.</summary>
+    internal static string Qualify(string table)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(table);
+        var parts = table.Split('.');
+        if (parts.Length > 2 || parts.Any(p => !Identifier().IsMatch(p)))
+            throw new ArgumentException($"'{table}' is not a table name (table or schema.table).", nameof(table));
+        return string.Join('.', parts.Select(p => $"\"{p}\""));
+    }
+
+    [System.Text.RegularExpressions.GeneratedRegex("^[A-Za-z_][A-Za-z0-9_]{0,62}$")]
+    private static partial System.Text.RegularExpressions.Regex Identifier();
 }

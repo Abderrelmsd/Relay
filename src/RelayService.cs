@@ -6,8 +6,11 @@ using Microsoft.Extensions.Options;
 
 namespace Relay;
 
-internal sealed class RelayOutbox(IRelayStore store, TimeProvider time) : IRelayOutbox
+internal sealed class RelayOutbox(IEnumerable<IRelayStore> stores, TimeProvider time) : IRelayOutbox
 {
+    // The first store registered receives messages enqueued without a transaction.
+    private readonly IRelayStore store = stores.First();
+
     public async Task<Guid> EnqueueAsync(RelayEnvelope e, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(e.Destination)) throw new ArgumentException("Destination is required.", nameof(e));
@@ -73,9 +76,10 @@ public interface IRelayProcessor
     Task<int> ProcessOnceAsync(CancellationToken cancellationToken = default);
 }
 
-internal sealed class RelayProcessor(IRelayStore store, IEnumerable<IRelayDestination> destinations, DestinationBreakers breakers,
+internal sealed class RelayProcessor(IEnumerable<IRelayStore> stores, IEnumerable<IRelayDestination> destinations, DestinationBreakers breakers,
     IOptions<RelayOptions> options, TimeProvider time, ILogger<RelayProcessor> logger) : IRelayProcessor
 {
+    private readonly IRelayStore[] _stores = stores.ToArray();
     private readonly RelayOptions _o = options.Value;
     private readonly IRelayDestination[] _all = destinations.ToArray();
     private readonly ConcurrentDictionary<string, IRelayDestination?> _resolved = new(StringComparer.Ordinal);
@@ -83,18 +87,26 @@ internal sealed class RelayProcessor(IRelayStore store, IEnumerable<IRelayDestin
 
     public async Task<int> ProcessOnceAsync(CancellationToken ct = default)
     {
+        var handled = 0;
+        foreach (var store in _stores) handled += await ProcessStoreAsync(store, ct);
+        return handled;
+    }
+
+    // Each store (one per database, say) is claimed and delivered in turn; circuit breakers are shared, as destinations are.
+    private async Task<int> ProcessStoreAsync(IRelayStore store, CancellationToken ct)
+    {
         var claimed = await store.ClaimAsync(_worker, _o.BatchSize, _o.LeaseDuration, time.GetUtcNow(), breakers.OpenDestinations(), ct);
         if (claimed.Count == 0) return 0;
 
         var handled = 0;
         await Parallel.ForEachAsync(claimed, new ParallelOptions { MaxDegreeOfParallelism = Math.Max(1, _o.MaxConcurrency), CancellationToken = ct }, async (m, token) =>
         {
-            if (await Deliver(m, token)) Interlocked.Increment(ref handled);
+            if (await Deliver(store, m, token)) Interlocked.Increment(ref handled);
         });
         return handled;
     }
 
-    private async Task<bool> Deliver(RelayMessage m, CancellationToken ct)
+    private async Task<bool> Deliver(IRelayStore store, RelayMessage m, CancellationToken ct)
     {
         var destination = _resolved.GetOrAdd(m.Destination, name => _all.FirstOrDefault(d => d.Name == name) ?? _all.FirstOrDefault(d => d.Handles(name)));
         if (destination is null)
@@ -193,11 +205,35 @@ public interface IRelayAdmin
     Task<RelayStats> GetStatsAsync(CancellationToken ct = default);
 }
 
-internal sealed class RelayAdmin(IRelayStore store, TimeProvider time) : IRelayAdmin
+/// <summary>Across every store: dead letters listed store by store, a requeue or purge applied where the message is, stats summed.</summary>
+internal sealed class RelayAdmin(IEnumerable<IRelayStore> stores, TimeProvider time) : IRelayAdmin
 {
-    public Task<IReadOnlyList<RelayMessage>> ListDeadLettersAsync(string? destination = null, int skip = 0, int take = 50, CancellationToken ct = default)
-        => store.ListDeadLettersAsync(destination, Math.Max(0, skip), Math.Clamp(take, 1, 500), ct);
-    public Task<bool> RequeueAsync(Guid messageId, CancellationToken ct = default) => store.RequeueDeadLetterAsync(messageId, time.GetUtcNow(), ct);
-    public Task<bool> PurgeAsync(Guid messageId, CancellationToken ct = default) => store.PurgeDeadLetterAsync(messageId, ct);
-    public Task<RelayStats> GetStatsAsync(CancellationToken ct = default) => store.GetStatsAsync(ct);
+    private readonly IRelayStore[] _stores = stores.ToArray();
+
+    public async Task<IReadOnlyList<RelayMessage>> ListDeadLettersAsync(string? destination = null, int skip = 0, int take = 50, CancellationToken ct = default)
+    {
+        var all = new List<RelayMessage>();
+        take = Math.Clamp(take, 1, 500);
+        foreach (var store in _stores) all.AddRange(await store.ListDeadLettersAsync(destination, 0, Math.Max(0, skip) + take, ct));
+        return [.. all.OrderBy(m => m.CreatedAt).Skip(Math.Max(0, skip)).Take(take)];
+    }
+
+    public async Task<bool> RequeueAsync(Guid messageId, CancellationToken ct = default)
+    {
+        foreach (var store in _stores) if (await store.RequeueDeadLetterAsync(messageId, time.GetUtcNow(), ct)) return true;
+        return false;
+    }
+
+    public async Task<bool> PurgeAsync(Guid messageId, CancellationToken ct = default)
+    {
+        foreach (var store in _stores) if (await store.PurgeDeadLetterAsync(messageId, ct)) return true;
+        return false;
+    }
+
+    public async Task<RelayStats> GetStatsAsync(CancellationToken ct = default)
+    {
+        var all = new List<RelayStats>();
+        foreach (var store in _stores) all.Add(await store.GetStatsAsync(ct));
+        return new RelayStats(all.Sum(s => s.Pending), all.Sum(s => s.InFlight), all.Sum(s => s.DeadLettered), all.Min(s => s.OldestPendingAt));
+    }
 }
