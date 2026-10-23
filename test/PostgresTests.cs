@@ -8,7 +8,8 @@ public sealed class PgFixture : IAsyncLifetime
 {
     private PostgreSqlContainer? _c;
     public bool Available { get; private set; }
-    public string? Reason { get; private set; }
+    // xUnit rejects a null skip reason even when the test runs, so it is never null.
+    public string Reason { get; private set; } = "Docker/Postgres unavailable";
     public NpgsqlDataSource? DataSource { get; private set; }
 
     public async ValueTask InitializeAsync()
