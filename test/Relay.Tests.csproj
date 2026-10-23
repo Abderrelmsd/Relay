@@ -6,5 +6,6 @@
     <PackageReference Include="Testcontainers.PostgreSql" Version="4.15.0" />
     <PackageReference Include="WolverineFx.RuntimeCompilation" Version="6.41.0" />
     <ProjectReference Include="..\src\Relay.csproj" />
+    <ProjectReference Include="..\wolverine\Relay.Wolverine.csproj" />
   </ItemGroup>
 </Project>
