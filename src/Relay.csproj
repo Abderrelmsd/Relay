@@ -3,7 +3,7 @@
     <RepositoryUrl>https://github.com/Abderrelmsd/Relay</RepositoryUrl>
     <PackageProjectUrl>https://github.com/Abderrelmsd/Relay</PackageProjectUrl>
     <PackageId>Relay</PackageId>
-    <Description>Persistent outbox for reliable async delivery: Wolverine enqueue handoff, then claiming, retry, circuit breaking, dead-lettering and per-key ordering owned by Relay.</Description>
+    <Description>Persistent outbox for reliable async delivery: transactional enqueue on Postgres, claiming, retry, circuit breaking, dead-lettering and per-key ordering. No messaging framework needed; Relay.Wolverine adds a Wolverine hand-off.</Description>
     <RootNamespace>Relay</RootNamespace>
   </PropertyGroup>
   <ItemGroup>
@@ -12,7 +12,6 @@
     <PackageReference Include="Microsoft.Extensions.Options" Version="10.0.12" />
     <PackageReference Include="Microsoft.Extensions.Options.DataAnnotations" Version="10.0.12" />
     <PackageReference Include="Npgsql" Version="10.0.3" />
-    <PackageReference Include="WolverineFx" Version="6.41.0" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.12" />
 
   </ItemGroup>

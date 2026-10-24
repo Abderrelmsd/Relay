@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RepositoryUrl>https://github.com/Abderrelmsd/Relay</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/Abderrelmsd/Relay</PackageProjectUrl>
+    <PackageId>Relay.Wolverine</PackageId>
+    <Description>Hands messages to Relay from inside a Wolverine handler, so the hand-off commits with the business transaction; Relay then owns delivery.</Description>
+    <RootNamespace>Relay</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="WolverineFx" Version="6.41.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\src\Relay.csproj" />
+  </ItemGroup>
+</Project>

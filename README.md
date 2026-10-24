@@ -2,7 +2,7 @@
 
 A persistent outbox for reliable asynchronous delivery. You enqueue a message; Relay stores it durably and delivers it to a named destination, with retries, backoff, circuit breaking, dead-lettering and per-key ordering.
 
-**Wolverine** performs the in-transaction hand-off when you use it; **Relay owns everything after that**: claiming, retrying, breaking, dead-lettering and ordering. Payloads are opaque bytes, and Relay never looks inside them.
+Enqueue inside your own Postgres transaction (`EnqueueInTransactionAsync`) or, with the **Relay.Wolverine** package, from a Wolverine handler; **Relay owns everything after that**: claiming, retrying, breaking, dead-lettering and ordering. Payloads are opaque bytes, and Relay never looks inside them.
 
 Use it for anything that must survive crashes and outages, such as emails, webhooks and calls to flaky systems.
 
@@ -23,7 +23,7 @@ services.AddRelayDispatcher();                             // the background del
 // Producer: durable, and idempotent by MessageId
 await outbox.EnqueueAsync(new RelayEnvelope { Destination = "email", Payload = bytes, OrderingKey = "user-42" });
 
-// Or through Wolverine, so the hand-off commits with your business transaction:
+// Or through Wolverine (the Relay.Wolverine package), so the hand-off commits with your business transaction:
 builder.UseWolverine(opts => opts.IncludeRelay());        // also reference WolverineFx.RuntimeCompilation, or pre-generate handler code
 await bus.PublishAsync(new EnqueueRelayMessage("email", bytes, OrderingKey: "user-42"));
 ```
